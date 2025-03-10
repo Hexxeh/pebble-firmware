@@ -100,7 +100,7 @@ _Static_assert(sizeof(struct FirmwareMetadata) == (sizeof(uint32_t) +
 #elif BOARD_SNOWY_BB
   #define FIRMWARE_METADATA_HW_PLATFORM (FirmwareMetadataPlatformPebbleSnowyBigboard)
 #elif BOARD_SNOWY_BB2
-  #define FIRMWARE_METADATA_HW_PLATFORM (FirmwareMetadataPlatformPebbleSnowyBigboard2)
+  #define FIRMWARE_METADATA_HW_PLATFORM (FirmwareMetadataPlatformPebbleSilkBigboard2)
 #elif BOARD_SNOWY_EVT2
   #define FIRMWARE_METADATA_HW_PLATFORM (FirmwareMetadataPlatformPebbleSnowyEVT2)
 #elif BOARD_SNOWY_DVT
