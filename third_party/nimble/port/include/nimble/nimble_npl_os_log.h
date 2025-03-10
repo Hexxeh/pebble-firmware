@@ -27,7 +27,7 @@
       const char *fmt, ...) {                                                        \
     va_list args;                                                                    \
     va_start(args, fmt);                                                             \
-    pbl_log_vargs(LOG_LEVEL_INFO, __FILE__, __LINE__, fmt, args);                    \
+    pbl_log_vargs(LOG_LEVEL_DEBUG_VERBOSE, __FILE__, __LINE__, fmt, args);                    \
     va_end(args);                                                                    \
   }
 
