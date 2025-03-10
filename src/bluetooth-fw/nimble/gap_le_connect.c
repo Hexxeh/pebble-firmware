@@ -16,4 +16,18 @@
 
 #include "bluetooth/gap_le_connect.h"
 
-int bt_driver_gap_le_disconnect(const BTDeviceInternal *peer_address) { return 0; }
+#include "host/ble_gap.h"
+#include "nimble_type_conversions.h"
+
+int bt_driver_gap_le_disconnect(const BTDeviceInternal *peer_address) {
+  uint16_t conn_handle;
+  int rc;
+
+  if (!pebble_device_to_nimble_conn_handle(peer_address, &conn_handle)) {
+    PBL_LOG(LOG_LEVEL_ERROR, "bt_driver_gap_le_disconnect: Failed to find connection handle");
+    return -1;
+  }
+
+  rc = ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+  return rc == 0 ? 0 : -1;
+}
