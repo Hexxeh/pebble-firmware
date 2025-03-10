@@ -51,8 +51,6 @@ static int prv_gatt_read_event_cb(uint16_t conn_handle, const struct ble_gatt_er
 
 BTErrno bt_driver_gatt_write_without_response(GAPLEConnection *connection, const uint8_t *value,
                                               size_t value_length, uint16_t att_handle) {
-  PBL_LOG_D(LOG_DOMAIN_BT, LOG_LEVEL_DEBUG, "bt_driver_gatt_write_without_response: %d",
-            att_handle);
   uint16_t conn_handle;
   if (!pebble_device_to_nimble_conn_handle(&connection->device, &conn_handle)) {
     return BTErrnoInvalidState;
@@ -64,7 +62,6 @@ BTErrno bt_driver_gatt_write_without_response(GAPLEConnection *connection, const
 
 BTErrno bt_driver_gatt_write(GAPLEConnection *connection, const uint8_t *value, size_t value_length,
                              uint16_t att_handle, void *context) {
-  PBL_LOG_D(LOG_DOMAIN_BT, LOG_LEVEL_DEBUG, "bt_driver_gatt_write: %d", att_handle);
   uint16_t conn_handle;
   if (!pebble_device_to_nimble_conn_handle(&connection->device, &conn_handle)) {
     return BTErrnoInvalidState;
@@ -76,7 +73,6 @@ BTErrno bt_driver_gatt_write(GAPLEConnection *connection, const uint8_t *value, 
 }
 
 BTErrno bt_driver_gatt_read(GAPLEConnection *connection, uint16_t att_handle, void *context) {
-  PBL_LOG_D(LOG_DOMAIN_BT, LOG_LEVEL_DEBUG, "bt_driver_gatt_read: %d", att_handle);
   uint16_t conn_handle;
   if (!pebble_device_to_nimble_conn_handle(&connection->device, &conn_handle)) {
     return BTErrnoInvalidState;
