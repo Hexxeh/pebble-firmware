@@ -31,6 +31,10 @@
 #include "util/circular_buffer.h"
 #include "util/math.h"
 
+#define TX_Q_SIZE   (MYNEWT_VAL(BLE_TRANSPORT_ACL_FROM_LL_COUNT) + \
+                     MYNEWT_VAL(BLE_TRANSPORT_EVT_COUNT) + \
+                     MYNEWT_VAL(BLE_TRANSPORT_EVT_DISCARDABLE_COUNT))
+
 extern void ble_chipset_init(void);
 extern bool ble_chipset_start(void);
 
@@ -49,6 +53,7 @@ static TaskHandle_t s_rx_task_handle;
 static CircularBuffer s_rx_buffer;
 static uint8_t s_rx_storage[1024];
 static SemaphoreHandle_t s_rx_data_ready;
+static SemaphoreHandle_t s_cmd_done;
 
 static QueueHandle_t s_tx_queue;
 static struct hci_h4_sm hci_uart_h4sm;
@@ -59,6 +64,8 @@ static void prv_lock(void) { portENTER_CRITICAL(); }
 static void prv_unlock(void) { portEXIT_CRITICAL(); }
 
 static int hci_uart_frame_cb(uint8_t pkt_type, void *data) {
+  xSemaphoreGive(s_cmd_done);
+
   // HACK: passing responses to commands Nimble didn't generate causes issues
   if (!chipset_start_done) {
     ble_transport_free(data);
@@ -137,6 +144,10 @@ static bool prv_uart_rx_irq_handler(UARTDevice *dev, uint8_t data,
                                     const UARTRXErrorFlags *err_flags) {
   BaseType_t should_context_switch = false;
 
+  if (err_flags->framing_error || err_flags->overrun_error) {
+    PBL_LOG(LOG_LEVEL_ERROR, "Bluetooth UART overrun:%d framing:%d", err_flags->overrun_error, err_flags->framing_error);
+  }
+
   prv_lock();
   PBL_ASSERTN(circular_buffer_get_write_space_remaining(&s_rx_buffer) > 0);
   circular_buffer_write(&s_rx_buffer, &data, 1);
@@ -164,7 +175,7 @@ static void prv_rx_task_main(void *unused) {
       }
 
       bytes_remaining = MIN(sizeof(read_buf), bytes_remaining);
-      circular_buffer_copy(&s_rx_buffer, &read_buf, bytes_remaining);
+      circular_buffer_copy(&s_rx_buffer, read_buf, bytes_remaining);
       prv_unlock();
 
       consumed_bytes = hci_h4_sm_rx(&hci_uart_h4sm, read_buf, bytes_remaining);
@@ -180,10 +191,11 @@ static void prv_rx_task_main(void *unused) {
 void ble_transport_ll_init(void) {
   hci_h4_sm_init(&hci_uart_h4sm, &hci_h4_allocs_from_ll, hci_uart_frame_cb);
 
-  s_tx_queue = xQueueCreate(1, sizeof(struct uart_tx *));
+  s_tx_queue = xQueueCreate(TX_Q_SIZE, sizeof(struct uart_tx *));
   PBL_ASSERTN(s_tx_queue);
 
   s_rx_data_ready = xSemaphoreCreateBinary();
+  s_cmd_done = xSemaphoreCreateBinary();
   circular_buffer_init(&s_rx_buffer, s_rx_storage, sizeof(s_rx_storage));
 
   ble_chipset_init();
@@ -227,6 +239,8 @@ void ble_queue_cmd(void *buf, bool needs_free) {
   tx_item->buf_needs_free = needs_free;
 
   ble_transport_tx_item(tx_item);
+
+  xSemaphoreTake(s_cmd_done, portMAX_DELAY);
 }
 
 /* APIs to be implemented by HS/LL side of transports */
