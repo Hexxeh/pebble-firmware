@@ -38,24 +38,28 @@
 extern void ble_chipset_init(void);
 extern bool ble_chipset_start(void);
 
-struct uart_tx {
-  uint8_t type;
-  uint8_t sent_type;
-  uint16_t len;
-  uint16_t idx;
+// Added to HCI task queue when data is received from UART
+const uint8_t HCI_TASK_MSG_RX = 0x01;
 
-  struct os_mbuf *om;
-  uint8_t *buf;
-  bool buf_needs_free;
-};
+// Added to HCI task queue when data is ready to be sent to UART or the UART sent a byte and is ready for another
+const uint8_t HCI_TASK_MSG_TX = 0x02;
 
-static TaskHandle_t s_rx_task_handle;
+typedef uint8_t hci_task_msg;
+
+static TaskHandle_t s_hci_task_handle;
+static QueueHandle_t s_hci_task_queue;
+
+#define DMA_BUFFER_LENGTH (200)
+static uint8_t DMA_BSS s_dma_buffer[DMA_BUFFER_LENGTH] __attribute__((aligned(4)));
+
 static CircularBuffer s_rx_buffer;
-static uint8_t s_rx_storage[1024];
-static SemaphoreHandle_t s_rx_data_ready;
+static uint8_t s_rx_storage[2048];
 static SemaphoreHandle_t s_cmd_done;
 
-static QueueHandle_t s_tx_queue;
+static CircularBuffer s_tx_buffer;
+static uint8_t s_tx_storage[1024];
+static SemaphoreHandle_t s_tx_buffer_drained;
+
 static struct hci_h4_sm hci_uart_h4sm;
 static bool chipset_start_done = false;
 
@@ -86,59 +90,43 @@ static int hci_uart_frame_cb(uint8_t pkt_type, void *data) {
   return -1;
 }
 
-static int hci_uart_tx_char(BaseType_t *should_context_switch) {
-  struct uart_tx *tx = NULL;
-  uint8_t ch;
+static int prv_get_next_tx_byte(void) {
+  const uint8_t *data;
+  uint16_t bytes_read;
+  int rc;
 
-  if (xQueuePeekFromISR(s_tx_queue, &tx) == pdFALSE) return -1;
+  prv_lock();
+  bool success = circular_buffer_read(&s_tx_buffer, 1, &data, &bytes_read);
 
-  if (!tx->sent_type) {
-    tx->sent_type = 1;
-    return tx->type;
-  }
-
-  switch (tx->type) {
-    case HCI_H4_CMD:
-      ch = tx->buf[tx->idx];
-      tx->idx++;
-      if (tx->idx == tx->len) {
-        if (tx->buf_needs_free) ble_transport_free(tx->buf);
-        xQueueReceiveFromISR(s_tx_queue, &tx, should_context_switch);
-        kernel_free(tx);
-      }
-      break;
-    case HCI_H4_ACL:
-    case HCI_H4_ISO:
-      os_mbuf_copydata(tx->om, 0, 1, &ch);
-      os_mbuf_adj(tx->om, 1);
-      tx->len--;
-      if (tx->len == 0) {
-        os_mbuf_free_chain(tx->om);
-        xQueueReceiveFromISR(s_tx_queue, &tx, should_context_switch);
-        kernel_free(tx);
-      }
-      break;
-    default:
-      WTF;
-  }
-
-  return ch;
-}
-
-static void ble_hci_tx_byte(BaseType_t *should_context_switch) {
-  int c = hci_uart_tx_char(should_context_switch);
-  if (c == -1) {
-    uart_set_tx_interrupt_enabled(BLUETOOTH_UART, false);
+  if (success) {
+    rc = *data;
+    circular_buffer_consume(&s_tx_buffer, 1);
   } else {
-    uart_write_byte(BLUETOOTH_UART, c);
+    rc = -1;
   }
+
+  prv_unlock();
+
+  return rc;
 }
 
 static bool prv_uart_tx_irq_handler(UARTDevice *dev) {
   BaseType_t should_context_switch = false;
-  ble_hci_tx_byte(&should_context_switch);
+
+  int byte = prv_get_next_tx_byte();
+  if (byte >= 0) {
+    uart_write_byte(BLUETOOTH_UART, byte);
+  } else {
+    uart_set_tx_interrupt_enabled(BLUETOOTH_UART, false);
+  }
+
+  xSemaphoreGiveFromISR(s_tx_buffer_drained, &should_context_switch);
+
   return should_context_switch;
 }
+
+static bool did_overrun = false;
+static bool did_framing_error = false;
 
 static bool prv_uart_rx_irq_handler(UARTDevice *dev, uint8_t data,
                                     const UARTRXErrorFlags *err_flags) {
@@ -147,47 +135,66 @@ static bool prv_uart_rx_irq_handler(UARTDevice *dev, uint8_t data,
   if (err_flags->framing_error || err_flags->overrun_error) {
     PBL_LOG_D(LOG_DOMAIN_BT, LOG_LEVEL_ERROR, "Bluetooth UART overrun:%d framing:%d",
               err_flags->overrun_error, err_flags->framing_error);
+    if (err_flags->overrun_error) {
+      did_overrun = true;
+    }
+    if (err_flags->framing_error) {
+      did_framing_error = true;
+    }
   }
 
   prv_lock();
   PBL_ASSERTN(circular_buffer_get_write_space_remaining(&s_rx_buffer) > 0);
   circular_buffer_write(&s_rx_buffer, &data, 1);
-  xSemaphoreGiveFromISR(s_rx_data_ready, &should_context_switch);
+  xQueueSendFromISR(s_hci_task_queue, &HCI_TASK_MSG_RX, &should_context_switch);
   prv_unlock();
 
   return should_context_switch;
 }
 
 static uint8_t read_buf[64];
-static void prv_rx_task_main(void *unused) {
+static void prv_hci_task_handle_rx(void) {
   int consumed_bytes;
   uint16_t bytes_remaining;
+  while (true) {
+    prv_lock();
+
+    bytes_remaining = circular_buffer_get_read_space_remaining(&s_rx_buffer);
+    if (bytes_remaining == 0) {
+      prv_unlock();
+      break;
+    }
+
+    bytes_remaining = MIN(sizeof(read_buf), bytes_remaining);
+    circular_buffer_copy(&s_rx_buffer, &read_buf, bytes_remaining);
+    prv_unlock();
+
+    consumed_bytes = hci_h4_sm_rx(&hci_uart_h4sm, read_buf, bytes_remaining);
+    PBL_ASSERTN(consumed_bytes >= 0);
+
+    prv_lock();
+    circular_buffer_consume(&s_rx_buffer, consumed_bytes);
+    prv_unlock();
+  }
+}
+
+static void prv_hci_task_handle_tx(void) {
+  uart_set_tx_interrupt_enabled(BLUETOOTH_UART, true);
+}
+
+static void prv_hci_task_main(void *unused) {
+  hci_task_msg msg;
 
   while (true) {
-    xSemaphoreTake(s_rx_data_ready, portMAX_DELAY);
+    xQueueReceive(s_hci_task_queue, &msg, portMAX_DELAY);
 
-    while (true) {
-      prv_lock();
-
-      bytes_remaining = circular_buffer_get_read_space_remaining(&s_rx_buffer);
-      if (bytes_remaining == 0) {
-        prv_unlock();
+    switch (msg) {
+      case HCI_TASK_MSG_RX:
+        prv_hci_task_handle_rx();
         break;
-      }
-
-      bytes_remaining = MIN(sizeof(read_buf), bytes_remaining);
-      circular_buffer_copy(&s_rx_buffer, read_buf, bytes_remaining);
-      prv_unlock();
-
-      consumed_bytes = hci_h4_sm_rx(&hci_uart_h4sm, read_buf, bytes_remaining);
-      if (consumed_bytes <= 0) {
-        PBL_LOG_D(LOG_DOMAIN_BT, LOG_LEVEL_ERROR, "hci_h4_sm_rx rc=%d", consumed_bytes);
+      case HCI_TASK_MSG_TX:
+        prv_hci_task_handle_tx();
         break;
-      }
-
-      prv_lock();
-      circular_buffer_consume(&s_rx_buffer, consumed_bytes);
-      prv_unlock();
     }
   }
 }
@@ -195,12 +202,15 @@ static void prv_rx_task_main(void *unused) {
 void ble_transport_ll_init(void) {
   hci_h4_sm_init(&hci_uart_h4sm, &hci_h4_allocs_from_ll, hci_uart_frame_cb);
 
-  s_tx_queue = xQueueCreate(TX_Q_SIZE, sizeof(struct uart_tx *));
-  PBL_ASSERTN(s_tx_queue);
+  s_hci_task_queue = xQueueCreate(8, sizeof(hci_task_msg));
+  PBL_ASSERTN(s_hci_task_queue);
 
-  s_rx_data_ready = xSemaphoreCreateBinary();
+  s_tx_buffer_drained = xSemaphoreCreateBinary();
   s_cmd_done = xSemaphoreCreateBinary();
+
   circular_buffer_init(&s_rx_buffer, s_rx_storage, sizeof(s_rx_storage));
+  circular_buffer_init(&s_tx_buffer, s_tx_storage, sizeof(s_tx_storage));
+  s_rx_buffer.auto_reset = false;
 
   ble_chipset_init();
 
@@ -209,76 +219,88 @@ void ble_transport_ll_init(void) {
   uart_set_rx_interrupt_handler(BLUETOOTH_UART, prv_uart_rx_irq_handler);
   uart_set_tx_interrupt_handler(BLUETOOTH_UART, prv_uart_tx_irq_handler);
   uart_set_rx_interrupt_enabled(BLUETOOTH_UART, true);
+  uart_start_rx_dma(BLUETOOTH_UART, s_dma_buffer, DMA_BUFFER_LENGTH);
+
+  xSemaphoreGive(s_tx_buffer_drained);
 
   TaskParameters_t task_params = {
-      .pvTaskCode = prv_rx_task_main,
-      .pcName = "NimbleRX",
+      .pvTaskCode = prv_hci_task_main,
+      .pcName = "NimbleHCI",
       .usStackDepth = 4000 / sizeof(StackType_t), // TODO: can probably be reduced
-      .uxPriority = (tskIDLE_PRIORITY + 3) | portPRIVILEGE_BIT,
+      .uxPriority = (configMAX_PRIORITIES - 2) | portPRIVILEGE_BIT,
       .puxStackBuffer = NULL,
   };
 
-  pebble_task_create(PebbleTask_BTHCI, &task_params, &s_rx_task_handle);
-  PBL_ASSERTN(s_rx_task_handle);
+  pebble_task_create(PebbleTask_BTHCI, &task_params, &s_hci_task_handle);
+  PBL_ASSERTN(s_hci_task_handle);
 
   if (ble_chipset_start()) {
     chipset_start_done = true;
   }
 }
 
-static void ble_transport_tx_item(struct uart_tx *tx_item) {
-  xQueueSendToBack(s_tx_queue, &tx_item, portMAX_DELAY);
-  uart_set_tx_interrupt_enabled(BLUETOOTH_UART, true);
+static void prv_tx_flatbuf(uint8_t *buf, uint16_t len) {
+  while (circular_buffer_get_write_space_remaining(&s_tx_buffer) < len) {
+    xSemaphoreTake(s_tx_buffer_drained, portMAX_DELAY);
+  }
+
+  bool complete_write = circular_buffer_write(&s_tx_buffer, buf, len);
+  PBL_ASSERTN(complete_write);
+
+  xQueueSend(s_hci_task_queue, &HCI_TASK_MSG_TX, portMAX_DELAY);
 }
 
-void ble_queue_cmd(void *buf, bool needs_free, bool wait) {
-  struct uart_tx *tx_item = kernel_malloc(sizeof(struct uart_tx));
-  PBL_ASSERTN(tx_item);
-  tx_item->type = HCI_H4_CMD;
-  tx_item->sent_type = 0;
-  tx_item->len = 3 + ((uint8_t *)buf)[2];
-  tx_item->buf = buf;
-  tx_item->idx = 0;
-  tx_item->om = NULL;
-  tx_item->buf_needs_free = needs_free;
+static void prv_tx_mbuf(struct os_mbuf *om) {
+  uint16_t len = OS_MBUF_PKTLEN(om);
+  while (circular_buffer_get_write_space_remaining(&s_tx_buffer) < len) {
+    xSemaphoreTake(s_tx_buffer_drained, portMAX_DELAY);
+  }
 
-  ble_transport_tx_item(tx_item);
+  uint8_t *data;
+  uint16_t available_space = circular_buffer_write_prepare(&s_tx_buffer, &data);
+  PBL_ASSERTN(available_space >= len);
+  os_mbuf_copydata(om, 0, len, data);
+  circular_buffer_write_finish(&s_tx_buffer, len);
 
-  if (wait) xSemaphoreTake(s_cmd_done, portMAX_DELAY);
+  xQueueSend(s_hci_task_queue, &HCI_TASK_MSG_TX, portMAX_DELAY);
+}
+
+void ble_queue_cmd(void *buf, bool wait) {
+  uint8_t type = HCI_H4_CMD;
+  uint16_t len = 3 + ((uint8_t *)buf)[2];
+
+  prv_tx_flatbuf(&type, 1);
+  prv_tx_flatbuf(buf, len);
+
+  if (wait) {
+    xSemaphoreTake(s_cmd_done, portMAX_DELAY);
+  }
 }
 
 /* APIs to be implemented by HS/LL side of transports */
 int ble_transport_to_ll_cmd_impl(void *buf) {
-  ble_queue_cmd(buf, true, false);
+  ble_queue_cmd(buf, false);
+  ble_transport_free(buf);
+
   return 0;
 }
 
 int ble_transport_to_ll_acl_impl(struct os_mbuf *om) {
-  struct uart_tx *tx_item = kernel_malloc(sizeof(struct uart_tx));
-  PBL_ASSERTN(tx_item);
-  tx_item->type = HCI_H4_ACL;
-  tx_item->sent_type = 0;
-  tx_item->len = OS_MBUF_PKTLEN(om);
-  tx_item->buf = NULL;
-  tx_item->idx = 0;
-  tx_item->om = om;
+  uint8_t type = HCI_H4_ACL;
 
-  ble_transport_tx_item(tx_item);
+  prv_tx_flatbuf(&type, 1);
+  prv_tx_mbuf(om);
+  os_mbuf_free_chain(om);
 
   return 0;
 }
 
 int ble_transport_to_ll_iso_impl(struct os_mbuf *om) {
-  struct uart_tx *tx_item = kernel_malloc(sizeof(struct uart_tx));
-  PBL_ASSERTN(tx_item);
-  tx_item->type = HCI_H4_ISO;
-  tx_item->sent_type = 0;
-  tx_item->len = OS_MBUF_PKTLEN(om);
-  tx_item->buf = NULL;
-  tx_item->idx = 0;
-  tx_item->om = om;
+  uint8_t type = HCI_H4_ISO;
 
-  ble_transport_tx_item(tx_item);
+  prv_tx_flatbuf(&type, 1);
+  prv_tx_mbuf(om);
+  os_mbuf_free_chain(om);
 
   return 0;
 }

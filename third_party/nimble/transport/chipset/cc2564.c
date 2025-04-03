@@ -42,7 +42,7 @@ typedef struct PACKED {
   uint32_t baud_rate;
 } BTSHCIUpdateBaudRateCommand;
 
-extern void ble_queue_cmd(void *buf, bool needs_free, bool wait);
+extern void ble_queue_cmd(void *buf, bool wait);
 
 static bool ble_run_bts(const ResAppNum bts_file) {
   size_t i = 0;
@@ -80,7 +80,7 @@ static bool ble_run_bts(const ResAppNum bts_file) {
       command = (BTSHCICommand *)&baud_rate_command;
     }
 
-    ble_queue_cmd(&command->opcode, false, true);
+    ble_queue_cmd(&command->opcode, true);
 
     if (command->opcode == HCI_VS_UPDATE_UART_HCI_BAUDRATE) {
       uart_set_baud_rate(BLUETOOTH_UART, HCI_BAUD_RATE);

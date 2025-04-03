@@ -117,7 +117,7 @@ static DMARequest BLUETOOTH_UART_RX_DMA_REQUEST = {
   .state = &s_bluetooth_uart_rx_dma_request_state,
   .stream = &DMA2_STREAM2_DEVICE,
   .channel = 4,
-  .irq_priority = 0x0e,
+  .irq_priority = 0x0b,
   .priority = DMARequestPriority_High,
   .type = DMARequestType_PeripheralToMemory,
   .data_size = DMARequestDataSize_Byte,
@@ -214,7 +214,7 @@ static UARTDevice BLUETOOTH_UART_DEVICE = {
   .irq_channel = USART1_IRQn,
   .irq_priority = 0xe,
   .rcc_apb_periph = RCC_APB2Periph_USART1,
-  // .rx_dma = &BLUETOOTH_UART_RX_DMA_REQUEST
+  .rx_dma = &BLUETOOTH_UART_RX_DMA_REQUEST
 };
 UARTDevice * const BLUETOOTH_UART = &BLUETOOTH_UART_DEVICE;
 IRQ_MAP(USART1, uart_irq_handler, BLUETOOTH_UART);

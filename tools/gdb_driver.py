@@ -19,6 +19,7 @@ import time
 
 def find_gdb_path():
     """ Find the first arm gdb on our path"""
+    return '/opt/homebrew/bin/gdb'
     prioritized_names = ['pebble-gdb', 'arm-none-eabi-gdb-py', 'arm-none-eabi-gdb']
     for name in prioritized_names:
         try:

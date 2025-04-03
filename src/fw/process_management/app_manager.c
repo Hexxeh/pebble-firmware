@@ -237,7 +237,7 @@ static size_t prv_get_app_stack_size(const PebbleProcessMd *app_md) {
     return APP_STACK_ROCKY_SIZE;
   }
 #endif
-  return APP_STACK_NORMAL_SIZE;
+  return APP_STACK_NORMAL_SIZE * 2;
 }
 
 T_STATIC MemorySegment prv_get_app_ram_segment(void) {
