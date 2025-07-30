@@ -35,8 +35,11 @@
   (MYNEWT_VAL(BLE_TRANSPORT_ACL_FROM_LL_COUNT) + MYNEWT_VAL(BLE_TRANSPORT_EVT_COUNT) + \
    MYNEWT_VAL(BLE_TRANSPORT_EVT_DISCARDABLE_COUNT))
 
-extern void ble_chipset_init(void);
+extern void ble_chipset_init(UARTRXInterruptHandler rx_interrupt_handler, 
+                             UARTTXInterruptHandler tx_interrupt_handler);
 extern bool ble_chipset_start(void);
+extern bool ble_chipset_handle_hci_frame(uint8_t pkt_type, void *data);
+extern bool ble_chipset_ensure_awake(void);
 
 struct uart_tx {
   uint8_t type;
@@ -68,11 +71,13 @@ static void prv_lock(void) { portENTER_CRITICAL(); }
 static void prv_unlock(void) { portEXIT_CRITICAL(); }
 
 static int hci_uart_frame_cb(uint8_t pkt_type, void *data) {
+  // should we give the semaphore if we receive eHCILL commands?
   xSemaphoreGive(s_cmd_done);
 
   // HACK: passing responses to commands Nimble didn't generate causes issues
   if (!chipset_start_done) {
-    ble_transport_free(data);
+    ble_chipset_handle_hci_frame(pkt_type, data);
+    if (data != NULL) ble_transport_free(data);
     return 0;
   }
 
@@ -84,7 +89,14 @@ static int hci_uart_frame_cb(uint8_t pkt_type, void *data) {
     case HCI_H4_ISO:
       return ble_transport_to_hs_iso(data);
     default:
-      WTF;
+      if (ble_chipset_handle_hci_frame(pkt_type, data)) {
+        if (data != NULL) ble_transport_free(data);
+        return 0;
+      } else {
+        PBL_LOG_D(LOG_DOMAIN_BT_STACK, LOG_LEVEL_ERROR,
+                  "Unhandled HCI packet type %d", pkt_type);
+        WTF;
+      }
   }
 
   return -1;
@@ -147,6 +159,12 @@ static int hci_uart_tx_char(BaseType_t *should_context_switch) {
 }
 
 static void ble_hci_tx_byte(BaseType_t *should_context_switch) {
+  if (!ble_chipset_ensure_awake()) {
+    // If the chipset is not awake, we can't send data
+    PBL_LOG_D(LOG_DOMAIN_BT, LOG_LEVEL_WARNING, "Chipset not awake, cannot send data");
+    return;
+  }
+
   int c = hci_uart_tx_char(should_context_switch);
   if (c == -1) {
     uart_set_tx_interrupt_enabled(BLUETOOTH_UART, false);
@@ -236,13 +254,7 @@ void ble_transport_ll_init(void) {
   s_cmd_done = xSemaphoreCreateBinary();
   circular_buffer_init(&s_rx_buffer, s_rx_storage, sizeof(s_rx_storage));
 
-  ble_chipset_init();
-
-  uart_init(BLUETOOTH_UART);
-  uart_set_baud_rate(BLUETOOTH_UART, 115200);
-  uart_set_rx_interrupt_handler(BLUETOOTH_UART, prv_uart_rx_irq_handler);
-  uart_set_tx_interrupt_handler(BLUETOOTH_UART, prv_uart_tx_irq_handler);
-  uart_set_rx_interrupt_enabled(BLUETOOTH_UART, true);
+  ble_chipset_init(prv_uart_rx_irq_handler, prv_uart_tx_irq_handler);
 
   TaskParameters_t task_params = {
       .pvTaskCode = prv_rx_task_main,
@@ -277,6 +289,8 @@ void ble_queue_cmd(void *buf, bool needs_free, bool wait) {
   tx_item->buf_needs_free = needs_free;
 
   ble_transport_tx_item(tx_item);
+
+  PBL_LOG_D(LOG_DOMAIN_BT_STACK, LOG_LEVEL_ERROR, "HCI command queued rc=%04X", *(uint16_t*)buf);
 
   if (wait) xSemaphoreTake(s_cmd_done, portMAX_DELAY);
 }

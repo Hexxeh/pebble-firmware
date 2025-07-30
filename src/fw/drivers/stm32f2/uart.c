@@ -21,6 +21,7 @@
 #include "drivers/gpio.h"
 #include "drivers/periph_config.h"
 #include "system/passert.h"
+#include <kernel/util/sleep.h>
 
 #include "FreeRTOS.h"
 
@@ -130,6 +131,9 @@ void uart_deinit(UARTDevice *dev) {
       .gpio_pin = dev->rx_gpio.gpio_pin
     };
     gpio_input_init(&input_config);
+  }
+  if (dev->enable_flow_control) {
+    dev->periph->CR3 |= ~USART_CR3_CTSE;
   }
 }
 
@@ -369,4 +373,14 @@ void uart_stop_rx_dma(UARTDevice *dev) {
 void uart_clear_rx_dma_buffer(UARTDevice *dev) {
   dev->state->rx_dma_index = dev->state->rx_dma_length -
                              dma_request_get_current_data_counter(dev->rx_dma);
+}
+
+void uart_assert_rts(UARTDevice *dev) {
+  PBL_ASSERTN(dev->enable_flow_control);
+  const OutputConfig output_config = {
+    .gpio = dev->rts_gpio.gpio,
+    .gpio_pin = dev->rts_gpio.gpio_pin
+  };
+  gpio_output_init(&output_config, GPIO_OType_PP, GPIO_Speed_25MHz);
+  gpio_output_set(&output_config, false);
 }

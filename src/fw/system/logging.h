@@ -136,7 +136,7 @@ int pbl_log_get_bin_format(char* buffer, int buffer_len, const uint8_t log_level
 #endif
 
 #ifndef LOG_DOMAIN_BT_STACK
-  #define LOG_DOMAIN_BT_STACK        0
+  #define LOG_DOMAIN_BT_STACK        1
 #endif
 
 #ifndef LOG_DOMAIN_DATA_LOGGING

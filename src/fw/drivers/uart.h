@@ -124,3 +124,5 @@ UARTRXErrorFlags uart_has_errored_out(UARTDevice *dev);
 //! Clears all interrupt flags
 //! @param[in] dev The UART device
 void uart_clear_all_interrupt_flags(UARTDevice *dev);
+
+void uart_assert_rts(UARTDevice *dev);
